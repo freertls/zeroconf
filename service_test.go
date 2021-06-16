@@ -2,12 +2,13 @@ package zeroconf
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"testing"
 	"time"
 )
 
-var (
+const (
 	mdnsName    = "test--xxxxxxxxxxxx"
 	mdnsService = "_test--xxxx._tcp"
 	mdnsSubtype = "_test--xxxx._tcp,_fancy"
@@ -158,36 +159,66 @@ func TestSubtype(t *testing.T) {
 		}
 	})
 
-	t.Run("ttl", func(t *testing.T) {
-		origTTL := defaultTTL
-		origCleanupFreq := cleanupFreq
-		origInitialQueryInterval := initialQueryInterval
-		t.Cleanup(func() {
-			defaultTTL = origTTL
-			cleanupFreq = origCleanupFreq
-			initialQueryInterval = origInitialQueryInterval
-		})
-		defaultTTL = 1 // 1 second
-		initialQueryInterval = 100 * time.Millisecond
-		cleanupFreq = 100 * time.Millisecond
+	t.Run("DoS protection", func(t *testing.T) {
+		origMaxSentEntries := maxSentEntries
+		maxSentEntries = 10
+		defer func() { maxSentEntries = origMaxSentEntries }()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		startMDNS(t, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
 
-		entries := make(chan *ServiceEntry, 100)
-		if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+		const firstName = mdnsName
+
+		go startMDNS(ctx, mdnsPort, firstName, mdnsSubtype, mdnsDomain)
+		time.Sleep(time.Second)
+
+		resolver, err := NewResolver(nil)
+		if err != nil {
+			t.Fatalf("Expected create resolver success, but got %v", err)
+		}
+		entries := make(chan *ServiceEntry, maxSentEntries+1)
+		received := make(chan *ServiceEntry, 10)
+		go func() {
+			for {
+				select {
+				case entry := <-entries:
+					if entry.Instance == firstName {
+						received <- entry
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		if err := resolver.Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
 			t.Fatalf("Expected browse success, but got %v", err)
 		}
-
-		<-ctx.Done()
-		if len(entries) < 2 {
-			t.Fatalf("Expected to have received at least 2 entries, but got %d", len(entries))
+		select {
+		case <-received:
+		case <-time.NewTimer(time.Second).C:
+			t.Fatal("expected to discover service")
 		}
-		res1 := <-entries
-		res2 := <-entries
-		if res1.ServiceInstanceName() != res2.ServiceInstanceName() {
-			t.Fatalf("expected the two entries to be identical")
+
+		for i := 1; i < maxSentEntries; i++ {
+			go startMDNS(ctx, mdnsPort, fmt.Sprintf("%s-%d", mdnsName, i), mdnsSubtype, mdnsDomain)
+		}
+		time.Sleep(time.Second)
+
+		select {
+		case entry := <-entries:
+			t.Fatalf("didn't expect to receive an entry, got %v", entry)
+		default:
+		}
+
+		// Announcing this service will cause the map to overflow.
+		go startMDNS(ctx, mdnsPort, fmt.Sprintf("%s-%d", mdnsName, maxSentEntries), mdnsSubtype, mdnsDomain)
+
+		// wait for a re-announcement of the firstName service
+		select {
+		case <-received:
+			cancel()
+		case <-ctx.Done():
+			t.Fatal("expected to discover service")
 		}
 	})
 }
