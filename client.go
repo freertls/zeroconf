@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -360,10 +361,11 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 // TODO: move error reporting to shutdown function as periodicQuery is called from
 // go routine context.
 func (c *client) periodicQuery(ctx context.Context, params *lookupParams) error {
-	// Do the first query immediately.
-	if err := c.query(params); err != nil {
-		return err
-	}
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 4 * time.Second
+	bo.MaxInterval = 60 * time.Second
+	bo.MaxElapsedTime = 0
+	bo.Reset()
 
 	const maxInterval = 60 * time.Second
 	interval := initialQueryInterval
